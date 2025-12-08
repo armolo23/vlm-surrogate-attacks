@@ -1,352 +1,120 @@
-# Dissecting Adversarial Robustness of Multimodal LM Agents
+# VLM Surrogate Attacks: Background-Focused Adversarial Examples
 
-Official code and data of our paper:<br>
-**Dissecting Adversarial Robustness of Multimodal LM Agents** <br>
-Chen Henry Wu, Rishi Shah, Jing Yu Koh, Ruslan Salakhutdinov, Daniel Fried, Aditi Raghunathan<br>
-Carnegie Mellon University <br>
-_ICLR 2025_ (also _Oral presentation at NeurIPS 2024 Open-World Agents Workshop_) <br>
+## The Problem Being Solved
 
-[**[Paper link]**](https://arxiv.org/abs/2406.12814) | [**[Website]**](https://chenwu.io/attack-agent/) | [**[Data]**](./data/)
+Vision-Language Models like GPT-4V, Claude, and LLaVA use a component called CLIP to understand images. CLIP was trained on billions of image-caption pairs from the internet, learning to connect visual features with text descriptions. When someone uploads an image of a product to an AI shopping assistant, CLIP helps the model "see" what's in the image.
 
-<br>
-<div align=center>
-    <img src="docs/attack-vwa.png" align="middle">
-</div>
-<br>
+Here's the vulnerability this work exploits. CLIP has a documented attention bias toward backgrounds. When CLIP looks at a photo of a watch on a table, it doesn't just analyze the watch. It analyzes the table, the lighting, the shadows, everything. Researchers have shown that CLIP often pays disproportionate attention to contextual background features rather than the central subject.
 
-## Contents
+This means it's possible to manipulate what CLIP "understands" about an image by changing only the background pixels while leaving the actual product completely untouched. A human looking at two photos side by side would see an identical watch. But CLIP might interpret one as "luxury item" and the other as "discount product" based solely on imperceptible background noise.
 
-- [Dissecting Adversarial Robustness of Multimodal LM Agents](#adversarial-attacks-on-multimodal-agents)
-  - [Contents](#contents)
-  - [Installation](#installation)
-    - [Install VisualWebArena](#install-visualwebarena)
-    - [Install this repository](#install-this-repository)
-  - [Additional Setup](#additional-setup)
-    - [Setup API Keys](#setup-api-keys)
-    - [Setup experiment directory](#setup-experiment-directory)
-  - [Usage](#usage)
-    - [Run attacks](#run-attacks)
-    - [Setup for episode-wise evaluation](#setup-for-episode-wise-evaluation)
-    - [Episode-wise evaluation](#episode-wise-evaluation)
-    - [Stepwise evaluation](#stepwise-evaluation)
-  - [Known Issues](#known-issues)
-  - [Citation](#citation)
+This matters for AI agent security. Imagine an AI shopping agent that uses vision models to compare products. An attacker could post product images with adversarially crafted backgrounds that make expensive items appear cheap to the AI while looking completely normal to human moderators reviewing the listings.
 
-## Installation
+---
 
-Our code requires two repositories, including this one. The file structure should look like this:
+## What Adversarial Attacks Actually Are
 
-```plaintext
-.
-├── agent-attack  # This repository
-└── visualwebarena
-```
+For a non-technical understanding, imagine a photo of a cat. To a human, it's obviously a cat. But if specific, carefully calculated noise is added to certain pixels, an AI classifier can be made to think it's seeing a toaster. The changes are so small that humans can't perceive them, but they push the AI's mathematical interpretation across a decision boundary.
 
-### Install VisualWebArena
+The technical mechanism works like this. Neural networks learn to map inputs (images) to outputs (classifications or embeddings) through millions of learned parameters. These mappings are continuous and differentiable, meaning small input changes produce small output changes in a smooth, calculable way. Adversarial attacks exploit this by computing the gradient of the output with respect to the input. The gradient tells exactly which direction to nudge each pixel to maximally change the output.
 
-> Can skip this step if you only want to run the lightweight [step-wise evaluation](#stepwise-evaluation) (e.g., for early development) or the [attacks](#run-attacks).
+Standard attacks like PGD (Projected Gradient Descent) perturb all pixels. This work constrains perturbations to background regions only.
 
-VisualWebArena is required if you want to run the episode-wise evaluation that reproduces the results in our paper.
-It requires at least 200GB of disk space and docker to run.
+---
 
-The original version of VisualWebArena can be found [here](https://github.com/web-arena-x/visualwebarena), but we [modified it](https://github.com/ChenWu98/visualwebarena) to support perturbation to the trigger images. Clone the modified version and install:
+## The Architecture of the Solution
 
-```bash
-git clone git@github.com:ChenWu98/visualwebarena.git
-cd visualwebarena/
-# Install based on the README.md of https://github.com/ChenWu98/visualwebarena
-# Make sure that `pytest -x` passes
-```
+This commit creates three new files forming a modular attack infrastructure.
 
-### Install this repository
+### `segmentation.py`
+Handles mask generation. It answers the question "which pixels are foreground (protected) and which are background (attackable)?" Three masking strategies are implemented:
 
-Clone the repository and install with pip:
+*   **bbox**: The MVP approach. Given a bounding box around the object, everything inside the box is foreground, everything outside is background. This is fast, requires no additional models, and works reliably. If the product is at position (100,100) with size (200,200), a binary mask is created where that rectangular region is zeros (protected) and everywhere else is ones (attackable).
+*   **SAM**: Uses Meta's Segment Anything Model for precise object boundaries. Instead of a crude rectangle, SAM can trace the exact silhouette of a watch, excluding shadows and reflections that extend beyond the bounding box. This costs more compute but produces tighter foreground isolation.
+*   **saliency**: Uses gradient-based attention maps to identify what the neural network itself considers "important" pixels. This is theoretically elegant because it protects exactly what the model focuses on, but it's computationally expensive and requires additional forward passes.
 
-```bash
-git clone git@github.com:ChenWu98/agent-attack.git
-cd agent-attack/
-python -m pip install -e .
-```
+### `clip_attack_background.py`
+The core attack implementation. It extends an existing attack class called `SSA_CommonWeakness` with spatial masking capabilities.
 
-You may need to install PyTorch according to your CUDA version.
+The original `SSA_CommonWeakness` attack works like this. It uses an ensemble of four CLIP models with different architectures (ViT-B/32, ViT-B/16, ViT-L/14, ViT-L/14-336). The ensemble matters because if perturbations are optimized against only one model, they might not transfer to other models. By attacking multiple CLIP variants simultaneously, perturbations are found that exploit shared vulnerabilities across the CLIP family.
 
-## Additional Setup
+The attack optimizes a loss function that pushes the image embedding toward a target text ("this is the cheapest product") and optionally away from a victim text ("this is an expensive product"). Over hundreds of iterations, the attack computes gradients and updates pixels to minimize this loss while staying within an epsilon-ball constraint (typically 16/255 per pixel, imperceptible to humans).
 
-### Setup API Keys
+The `SSA_CommonWeakness_Masked` subclass adds four-point mask enforcement, which is the critical innovation.
 
-> [!IMPORTANT]
-> Need to set up the corresponding API keys each time before running the code.
+---
 
-Configurate the OpenAI API key.
+## Four-Point Mask Enforcement
 
-```bash
-export OPENAI_API_KEY=<your-openai-api-key>
-```
+This is the technical core of the work. Simply multiplying gradients by a mask isn't sufficient to guarantee foreground preservation. Numerical errors, momentum accumulation, and clamping operations can leak perturbations into protected regions. The mask is enforced at four distinct points in the optimization loop.
 
-If using Claude, configurate the Anthropic API key.
+1.  **During random initialization**: Many attacks start with small random noise to escape local minima. After adding this noise, the original foreground is immediately composited back onto the image.
+    `x = original_x * (1 - mask) + x * mask`
+    This means "take original pixels where mask is 0 (foreground), take perturbed pixels where mask is 1 (background)."
 
-```bash
-export ANTHROPIC_API_KEY=<your-anthropic-api-key>
-```
+2.  **After gradient computation**: Before using gradients to update the image, gradients on foreground pixels are zeroed out with `grad = grad * mask`. This prevents any gradient signal from flowing into protected regions.
 
-If using Gemini, first install the [gcloud CLI](https://cloud.google.com/sdk/docs/install).
-Setup a Google Cloud project and get the ID at the [Google Cloud console](https://console.cloud.google.com/).
-Get the AI Studio API key from the [AI Studio console](https://aistudio.google.com/app/apikey).
-Authenticate Google Cloud and configure the AI Studio API key:
+3.  **After the inner loop update**: Even with masked gradients, momentum terms can accumulate information that slightly affects protected pixels through numerical precision issues. Foreground pixels are forced back to their original values after each update step.
 
-```bash
-gcloud auth login
-gcloud config set project <your-google-cloud-project-id>
-export VERTEX_PROJECT=<your-google-cloud-project-id>  # Same as above
-export AISTUDIO_API_KEY=<your-aistudio-api-key>
-```
+4.  **After the `end_attack` method**: The parent class `SSA_CommonWeakness` has its own `end_attack` processing (outer momentum updates, spectrum transformations). These operations might introduce tiny foreground changes. One final enforcement is applied after this processing completes.
 
-### Setup experiment directory
+This belt-and-suspenders approach ensures that regardless of what happens inside the optimization loop, the foreground emerges mathematically identical to the input.
 
-> Only need to do this once.
+---
 
-Copy the raw data files to the experiment data directory:
+## The Optimization Loop Structure
 
-```bash
-scp -r data/ exp_data/
-```
+Each iteration of the attack follows this sequence:
 
-The adversarial examples will later be saved to the `exp_data/` directory.
+1.  **`begin_attack`** is called which resets internal state and prepares the gradient recording infrastructure.
+2.  The loop runs through all four **CLIP models**. For each model, the loss between the current image embedding and the target text embedding is computed. The loss function uses cosine similarity in CLIP's joint embedding space. Backpropagation gets gradients with respect to input pixels, the mask is applied to zero foreground gradients, and the gradient is recorded for later aggregation.
+3.  After collecting gradients from all models, the image is updated using **momentum-based gradient descent**. The inner momentum helps escape local minima and stabilizes updates across iterations. Pixel values are clamped to [0,1] and to the epsilon-ball around the original image.
+4.  **`end_attack`** handles outer loop processing, including spectrum-based augmentations that improve transferability. SSA (Spectrum Simulation Attack) transforms gradients into frequency space using DCT, applies random filtering, and transforms back. This prevents overfitting to specific frequency patterns of the surrogate models.
+5.  Every 100 iterations, a **snapshot** of the adversarial image is saved. This allows examination of attack progression and choosing early-stopped versions if the final iteration overfits.
 
-## Usage
+---
 
-### Run attacks
+## Foreground Preservation Metrics
 
-> Can skip this step if you want to see how the attacks break the agent without running the attacks yourself. We have provided the pre-generated adversarial examples.
+The `compute_foreground_metrics` function quantifies how well the mask enforcement worked.
 
-This section describes how to reproduce the attacks in our paper.
-Each attack on an image takes about 1 hour on a single GPU. FYI, we used NVIDIA A100 (80G) for the captioner attack and NVIDIA A6000 for the CLIP attack.
+*   **PSNR (Peak Signal-to-Noise Ratio)**: Measures pixel-level fidelity. It compares original and adversarial foreground pixels. Perfect preservation yields infinite PSNR. Values above 40dB indicate negligible changes invisible to humans.
+*   **SSIM (Structural Similarity Index)**: Measures perceptual similarity accounting for luminance, contrast, and structure. It's more aligned with human vision than raw pixel comparisons. A score of 1.0 means identical images.
+*   **Max change**: Reports the largest absolute pixel difference in the foreground. With proper mask enforcement, this should be exactly 0.0 (or floating-point epsilon). Any non-zero value indicates mask leakage.
 
-To run the captioner attack:
+---
 
-```bash
-python scripts/run_cap_attack.py
-```
+## The Broader Research Context
 
-To run the CLIP attack, run the corresponding script for each model:
+This work connects to several important research threads.
 
-```bash
-python scripts/run_clip_attack.py --model gpt-4-vision-preview
-python scripts/run_clip_attack.py --model gemini-1.5-pro-latest
-python scripts/run_clip_attack.py --model claude-3-opus-20240229
-python scripts/run_clip_attack.py --model gpt-4o-2024-05-13
-```
+*   **Surrogate attacks exploit transferability.** Gradients can't be computed through proprietary models like GPT-4V because there's no access to their weights. But perturbations optimized against open-source surrogates (CLIP models under control) often transfer to black-box targets. This is because different vision models learn similar low-level features and share similar vulnerability surfaces.
+*   **Background attacks are a specific form of constrained adversarial examples.** Prior work on patch attacks showed classifiers can be fooled by modifying small image regions. This approach inverts that by protecting small regions and attacking everything else.
+*   **The CLIP background attention bias** was documented in papers analyzing CLIP's failure modes. Models trained on internet-scraped data inherit biases from how photographers compose images. CLIP learns spurious correlations between backgrounds and concepts because training data isn't controlled for confounders.
 
-The generated adversarial examples will be saved to files in the `exp_data/` directory.
+---
 
-### Setup for episode-wise evaluation
+## What the Test File Validates
 
-> [!IMPORTANT]
-> Need to set up the urls each time before running the code.
+The `test_background_attack.py` file provides verification that mask enforcement works correctly across edge cases.
 
-Configurate the urls for each website:
+*   Tests verify that foreground pixels remain mathematically unchanged (`max_change == 0`).
+*   Mask generation is verified to produce correct shapes and semantics.
+*   The attack is confirmed to produce valid adversarial images that satisfy epsilon constraints.
+*   Tests check that the attack runs on both CPU and CUDA without errors.
 
-```bash
-export CLASSIFIEDS="http://127.0.0.1:9980"
-# Default reset token for classifieds site, change if you edited its docker-compose.yml
-export CLASSIFIEDS_RESET_TOKEN="4b61655535e7ed388f0d40a93600254c"
-export SHOPPING="http://127.0.0.1:7770"
-export REDDIT="http://127.0.0.1:9999"
-export WIKIPEDIA="http://127.0.0.1:8888"
-export HOMEPAGE="http://127.0.0.1:4399"
-```
+---
 
-You can replace the `http://127.0.0.1` with the actual IP address you are using.
+## Practical Implications
 
-> Only need to process the data files once.
+This infrastructure enables systematic study of a real vulnerability in deployed AI systems. Shopping agents, content moderation systems, and visual search engines all rely on vision encoders descended from CLIP-like architectures.
 
-Process the data files (e.g., replace the url placeholders with the actual urls):
+An attacker with this code could upload product images where the item looks identical to humans but appears misclassified to AI agents. A legitimate security researcher could use this to benchmark model robustness before deployment.
 
-```bash
-python scripts/process_data.py --data_dir exp_data/
-```
+The four-point enforcement pattern is a contribution to adversarial ML methodology. Prior masked attack implementations often leaked perturbations through numerical edge cases. The explicit multi-point enforcement provides stronger guarantees.
 
-### Episode-wise evaluation
+The modular design separating segmentation, attack logic, and metrics allows swapping components independently. SAM-based masks can be tested against bbox masks without rewriting attack code. New CLIP variants can be added to the ensemble without touching segmentation.
 
-Run the episode-wise evaluation for the GPT-4V + SoM agent:
+---
 
-```bash
-# Episode-wise, benign
-bash episode_scripts/gpt4v_benign.sh
-
-# Episode-wise, benign, no captioning
-bash episode_scripts/gpt4v_benign_no_cap.sh
-
-# Episode-wise, benign, self-caption
-bash episode_scripts/gpt4v_benign_self_cap.sh
-
-# Episode-wise, with captioner attack
-bash episode_scripts/gpt4v_bim_caption_attack.sh
-
-# Episode-wise, with CLIP attack
-bash episode_scripts/gpt4v_clip_attack_self_cap.sh
-
-# Episode-wise, with CLIP attack, no captioning
-bash episode_scripts/gpt4v_clip_attack_no_cap.sh
-```
-
-Run the episode-wise evaluation for the GPT-4o (05-13) + SoM agent:
-
-```bash
-# Episode-wise, benign
-bash episode_scripts/gpt4o_benign.sh
-
-# Episode-wise, benign, no captioning
-bash episode_scripts/gpt4o_benign_no_cap.sh
-
-# Episode-wise, benign, self-caption
-bash episode_scripts/gpt4o_benign_self_cap.sh
-
-# Episode-wise, with captioner attack
-bash episode_scripts/gpt4o_bim_caption_attack.sh
-
-# Episode-wise, with CLIP attack
-bash episode_scripts/gpt4o_clip_attack_self_cap.sh
-
-# Episode-wise, with CLIP attack, no captioning
-bash episode_scripts/gpt4o_clip_attack_no_cap.sh
-```
-
-Run the episode-wise evaluation for the Gemini 1.5 Pro + SoM agent:
-
-```bash
-# Episode-wise, benign
-bash episode_scripts/gemini1.5pro_benign.sh
-
-# Episode-wise, benign, no captioning
-bash episode_scripts/gemini1.5pro_benign_no_cap.sh
-
-# Episode-wise, benign, self-caption
-bash episode_scripts/gemini1.5pro_benign_self_cap.sh
-
-# Episode-wise, with captioner attack
-bash episode_scripts/gemini1.5pro_bim_caption_attack.sh
-
-# Episode-wise, with CLIP attack
-bash episode_scripts/gemini1.5pro_clip_attack_self_cap.sh
-
-# Episode-wise, with CLIP, no captioning
-bash episode_scripts/gemini1.5pro_clip_attack_no_cap.sh
-```
-
-Run the episode-wise evaluation for Claude 3 Opus + SoM agent:
-
-```bash
-# Episode-wise, benign
-bash episode_scripts/claude3opus_benign.sh
-
-# Episode-wise, benign, no captioning
-bash episode_scripts/claude3opus_benign_no_cap.sh
-
-# Episode-wise, benign, self-caption
-bash episode_scripts/claude3opus_benign_self_cap.sh
-
-# Episode-wise, with captioner attack
-bash episode_scripts/claude3opus_bim_caption_attack.sh
-
-# Episode-wise, with CLIP attack
-bash episode_scripts/claude3opus_clip_attack_self_cap.sh
-
-# Episode-wise, with CLIP attack, no captioning
-bash episode_scripts/claude3opus_clip_attack_no_cap.sh
-```
-
-### Stepwise evaluation
-
-Run the stepwise evaluation for the GPT-4V + SoM agent:
-
-```bash
-# Step-wise, benign
-bash step_scripts/gpt4v_benign.sh
-
-# Step-wise, benign, no captioning
-bash step_scripts/gpt4v_benign_no_cap.sh
-
-# Step-wise, with captioner attack
-bash step_scripts/gpt4v_bim_caption_attack.sh
-
-# Step-wise, with CLIP attack
-bash step_scripts/gpt4v_clip_attack_self_cap.sh
-
-# Step-wise, with CLIP attack, no captioning
-bash step_scripts/gpt4v_clip_attack_no_cap.sh
-```
-
-Run the stepwise evaluation for the GPT-4o (05-13) + SoM agent:
-
-```bash
-# Step-wise, benign
-bash step_scripts/gpt4o_benign.sh
-
-# Step-wise, benign, no captioning
-bash step_scripts/gpt4o_benign_no_cap.sh
-
-# Step-wise, with captioner attack
-bash step_scripts/gpt4o_bim_caption_attack.sh
-
-# Step-wise, with CLIP attack
-bash step_scripts/gpt4o_clip_attack_self_cap.sh
-
-# Step-wise, with CLIP attack, no captioning
-bash step_scripts/gpt4o_clip_attack_no_cap.sh
-```
-
-Run the stepwise evaluation for the Gemini 1.5 Pro + SoM agent:
-
-```bash
-# Step-wise, benign
-bash step_scripts/gemini1.5pro_benign.sh
-
-# Step-wise, benign, no captioning
-bash step_scripts/gemini1.5pro_benign_no_cap.sh
-
-# Step-wise, with captioner attack
-bash step_scripts/gemini1.5pro_bim_caption_attack.sh
-
-# Step-wise, with CLIP attack
-bash step_scripts/gemini1.5pro_clip_attack_self_cap.sh
-
-# Step-wise, with CLIP, no captioning
-bash step_scripts/gemini1.5pro_clip_attack_no_cap.sh
-```
-
-Run the stepwise evaluation for the Claude 3 Opus + SoM agent:
-
-```bash
-# Step-wise, benign
-bash step_scripts/claude3opus_benign.sh
-
-# Step-wise, benign, no captioning
-bash step_scripts/claude3opus_benign_no_cap.sh
-
-# Step-wise, with captioner attack
-bash step_scripts/claude3opus_bim_caption_attack.sh
-
-# Step-wise, with CLIP attack
-bash step_scripts/claude3opus_clip_attack_self_cap.sh
-
-# Step-wise, with CLIP attack, no captioning
-bash step_scripts/claude3opus_clip_attack_no_cap.sh
-```
-
-## Known Issues
-
-See the ``FIXME`` comments in the code for some hard-coded hacks we used to work around slight differences in the environment.
-
-## Citation
-
-If you find this code useful, please consider citing our paper:
-
-```bibtex
-@article{wu2024agentattack,
-  title={Dissecting Adversarial Robustness of Multimodal LM Agents},
-  author={Wu, Chen Henry and Shah, Rishi and Koh, Jing Yu and Salakhutdinov, Ruslan and Fried, Daniel and Raghunathan, Aditi},
-  journal={arXiv preprint arXiv:2406.12814},
-  year={2024}
-}
-```
+*This is Phase 1 infrastructure. The next phases would involve empirical validation against real VLM targets, analysis of transferability rates, and potentially defense mechanisms that detect background-only perturbations.*
